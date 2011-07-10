@@ -3,7 +3,8 @@
 (use srfi-1)
 (use util.match)
 (use c-wrapper)
-(c-load-library "libcurses.so")
+;(c-load-library "libcurses.so")
+(c-load-library "libncursesw.so")
 (c-include "curses.h")
 
 (define (draw-line window y x line)
@@ -16,6 +17,7 @@
          (mvwprintw window y x "%s" str)
          (draw-line window y (+ x (string-length str)) (cdr line)))
         (('word-space)
+         (mvwprintw window y x "  ")
          (draw-line window y (+ x 2) (cdr line)))
         )))
 
@@ -32,8 +34,10 @@
              (cons y (+ x 1))
              (real-cursor-line-pos-sub y (+ x 2) (cdr line) (+ pos 1))))
         ))
-  (real-cursor-line-pos-sub y0 x0 lines 0)
-  )
+  (if (null? lines)
+      (cons y0 x0)
+      (real-cursor-line-pos-sub y0 x0 lines 0)
+  ))
 
 (define (real-cursor-pos window y0 x0 lines cursor)
   (real-cursor-line-pos window (+ y0 (cursor-line cursor)) x0 (text-object-ref 'line lines cursor) cursor))
@@ -46,6 +50,8 @@
 (define (draw-window window y x lines)
   (map
    (lambda (lineno line)
+     (wmove window (+ y lineno) x)
+     (wclrtoeol window)
      (draw-line window (+ y lineno) x line))
    (iota (length lines))
    lines)
@@ -74,10 +80,110 @@
    ('element
     (list-ref
      (text-object-ref 'line lines cursor)
-     (cursor-element cursor)))
+     (cursor-element cursor) #f))
    ('char
     #f)))
  
+(define (compound-elements-reversed elem1 pos elem2)
+  (match (list elem1 elem2)
+    ((('word-str str1) ('word-str str2))
+     `((word-str
+        ,(cond
+          ((= pos 0)
+           (string-append str2 str1))
+          ((or (= pos -1) (>= pos (string-length str1)))
+           (string-append str1 str2))
+          (else
+           (string-append
+            (substring str1 0 pos)
+            str2
+            (substring str1 pos (string-length str1))))))))
+    ((('word-str str) (and separator (or ('word-space) ('line-break))))
+     (cond
+      ((= pos 0)
+       `((word-str ,str) ,separator)
+       )
+      ((or (= pos -1) (>= pos (string-length str)))
+       `(,separator (word-str ,str))
+       )
+      (else
+       `((word-str ,(substring str pos (string-length str)))
+         ,separator
+         (word-str ,(substring str 0 pos))))))
+    (else
+     (cond
+      ((or (= pos -1) (= pos 1))
+       `(,elem2 ,elem1))
+      ((= pos 0)
+       `(,elem1 ,elem2))
+      (else
+       (error "invalid combination. got:" elem1 pos elem2)
+      ))
+    )))
+
+(define (compound-elements elem1 pos elem2)
+  (reverse! (compound-elements elem1 pos elem2)))
+
+(define (insert-element-line-reverse line cursor elem)
+  (let* ((not-line-head? (> (cursor-element cursor) 0))
+         (elem-head? (= (cursor-char cursor) 0))
+         (pos-elem (+ (cursor-element cursor)
+                     (if (and not-line-head? elem-head?)
+                         -1
+                         0)))
+        (pos-char (if (and not-line-head? elem-head?)
+                      -1
+                      (cursor-char cursor))))
+    (let loop ((xs (drop line (+ pos-elem 1)))
+               (acc
+                (append
+                 (compound-elements-reversed 
+                  (list-ref line pos-elem)
+                  pos-char
+                  elem)
+                 (reverse (take line pos-elem)))))
+      (if (null? xs)
+          acc
+          (loop
+           (cdr xs)
+           (append
+            (compound-elements-reversed (car acc) -1 (car xs))
+            (cdr acc)))))))
+
+(define (insert-element-line line cursor elem)
+  (reverse! (insert-element-line-reverse line cursor elem)))
+
+(define (list-split-reverse lis elt)
+  (let loop ((lis lis)
+             (acc ())
+             (rslt ()))
+    (cond
+     ((null? lis)
+      (cons (reverse! acc) rslt))
+     ((equal? (car lis) elt)
+      (loop (cdr lis) () (cons (reverse! acc) rslt)))
+     (else
+      (loop (cdr lis) (cons (car lis) acc) rslt)))))
+
+(define (list-split lis elt)
+  (reverse! (list-split-reverse lis elt)))
+
+(define (insert-element lines cursor elem)
+  (append
+   (take lines (cursor-line cursor))
+   (list-split
+    (insert-element-line (list-ref lines (cursor-line cursor)) cursor elem)
+    '(line-break))
+   (drop lines (+ (cursor-line cursor) 1))))
+  
+(define (append-element lines cursor elem)
+  (insert-element lines
+                  (list
+                   (cursor-line cursor)
+                   (cursor-element cursor)
+                   (+ (cursor-char cursor) 1))
+                  elem))
+
 (define (move-cursor unit x modifier lines cursor)
   (match unit
    ('line
@@ -150,6 +256,8 @@
      (word-space)
      (word-str "2nd") (word-space) (word-str "line"))
     ((word-str "3rd") (word-space) (word-str "line"))
+    ()
+    ((word-str "5th") (word-space) (word-str "line"))
   ))
 
 (define (main args)
@@ -188,12 +296,17 @@
                                       realpos
                                       cursor
                                       )))
-        (mvwprintw win (- line 5) (- cols (string-length elem-string) 5) elem-string)
-        (mvwprintw win (- line 4) (- cols (string-length position-string) 5) position-string))
+        (wmove win (- line 4) 1)
+        (wclrtoeol win)
+        (mvwprintw win (- line 4) 1 "%s %s" elem-string position-string))
       (draw-window win 1 1 buffer)
       (draw-cursor win 1 1 cursor buffer)
       (wrefresh win)
       (case (read-char)
+        ((#\1) (lp cursor (insert-element buffer cursor '(line-break))))
+        ((#\2) (lp cursor (append-element buffer cursor '(line-break))))
+        ((#\i) (lp cursor (insert-element buffer cursor '(word-str "i"))))
+        ((#\a) (lp cursor (append-element buffer cursor '(word-str "a"))))
         ((#\k) (lp (move-cursor 'line -1 #f buffer cursor) buffer))
         ((#\j) (lp (move-cursor 'line  1 #f buffer cursor) buffer))
         ((#\h) (lp (move-cursor 'char -1 #f buffer cursor) buffer))
