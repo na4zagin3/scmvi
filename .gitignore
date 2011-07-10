@@ -1,0 +1,7 @@
+.*.sw?
+*~
+*.cmi
+*.cmo
+*.aux
+*.dvi
+*.log
